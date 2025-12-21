@@ -4,7 +4,7 @@ import express, { Request, Response } from 'express';
 import readline from 'readline';
 import { getValidAccessToken, loadTokens, saveTokens } from '../token-manager.js';
 import { startOAuthFlow, exchangeCodeForTokens } from '../oauth.js';
-import { ensureRequiredSystemPrompt } from './middleware.js';
+import { ensureRequiredSystemPrompt, stripUnknownFields, renameConflictingTools, restoreToolNames } from './middleware.js';
 import { AnthropicRequest, AnthropicResponse, OpenAIChatCompletionRequest } from '../types.js';
 import { logger } from './logger.js';
 import {
@@ -160,7 +160,7 @@ parseArgs();
 const app = express();
 
 // Anthropic API configuration
-const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_API_URL = process.env.ANTHROPIC_UPSTREAM_URL || 'http://localhost:8080/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
 const ANTHROPIC_BETA =
   'oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14';
@@ -195,7 +195,8 @@ app.get('/v1/models', async (req: Request, res: Response) => {
       return;
     }
 
-    const response = await fetch('https://api.anthropic.com/v1/models', {
+    const modelsUrl = process.env.ANTHROPIC_UPSTREAM_URL?.replace('/v1/messages', '/v1/models') || 'http://localhost:8080/v1/models';
+    const response = await fetch(modelsUrl, {
       method: 'GET',
       headers: {
         'x-api-key': apiKey as string,
@@ -222,13 +223,16 @@ const handleMessagesRequest = async (req: Request, res: Response) => {
   const timestamp = new Date().toISOString();
 
   try {
-    // Get the request body as an AnthropicRequest
-    const originalRequest = req.body as AnthropicRequest;
+    // Get the request body and strip unknown fields (e.g., context_management from Agent SDK)
+    const originalRequest = stripUnknownFields(req.body as Record<string, unknown>);
 
     const hadSystemPrompt = !!(originalRequest.system && originalRequest.system.length > 0);
 
     // Ensure the required system prompt is present
-    const modifiedRequest = ensureRequiredSystemPrompt(originalRequest);
+    const withSystemPrompt = ensureRequiredSystemPrompt(originalRequest);
+
+    // Rename conflicting tool names (read/write/edit) to avoid Claude Code collisions
+    const { request: modifiedRequest, hasRenames: hasToolRenames } = renameConflictingTools(withSystemPrompt);
 
     // Determine which authentication method to use
     const clientBearerToken = extractBearerToken(req);
@@ -266,9 +270,15 @@ const handleMessagesRequest = async (req: Request, res: Response) => {
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
       res.status(response.status);
-      // Pipe the Anthropic response stream directly to the client
+      // Pipe the Anthropic response stream, restoring tool names if needed
+      const decoder = new TextDecoder();
       for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
-        res.write(chunk);
+        if (hasToolRenames) {
+          const text = decoder.decode(chunk, { stream: true });
+          res.write(restoreToolNames(text));
+        } else {
+          res.write(chunk);
+        }
       }
       res.end();
       // Logging for streaming responses
@@ -277,12 +287,24 @@ const handleMessagesRequest = async (req: Request, res: Response) => {
         data: undefined,
       });
     } else {
-      const responseData = (await response.json()) as AnthropicResponse;
-      logger.logRequest(requestId, timestamp, originalRequest, hadSystemPrompt, {
-        status: response.status,
-        data: responseData,
-      });
-      res.status(response.status).json(responseData);
+      if (hasToolRenames && response.ok) {
+        // Restore tool names in JSON response
+        const responseText = await response.text();
+        const restoredText = restoreToolNames(responseText);
+        const responseData = JSON.parse(restoredText) as AnthropicResponse;
+        logger.logRequest(requestId, timestamp, originalRequest, hadSystemPrompt, {
+          status: response.status,
+          data: responseData,
+        });
+        res.status(response.status).json(responseData);
+      } else {
+        const responseData = (await response.json()) as AnthropicResponse;
+        logger.logRequest(requestId, timestamp, originalRequest, hadSystemPrompt, {
+          status: response.status,
+          data: responseData,
+        });
+        res.status(response.status).json(responseData);
+      }
     }
   } catch (error) {
     // Log the error
@@ -294,6 +316,13 @@ const handleMessagesRequest = async (req: Request, res: Response) => {
       undefined,
       error instanceof Error ? error : new Error('Unknown error')
     );
+
+    // If headers were already sent (e.g., streaming response in progress),
+    // we cannot send an error response - just log and return
+    if (res.headersSent) {
+      logger.error(`[${requestId}] Error occurred after headers sent:`, error);
+      return;
+    }
 
     // Handle specific error cases
     if (error instanceof Error) {
@@ -443,6 +472,13 @@ const handleChatCompletionsRequest = async (req: Request, res: Response) => {
       error instanceof Error ? error : new Error('Unknown error'),
       'openai'
     );
+
+    // If headers were already sent (e.g., streaming response in progress),
+    // we cannot send an error response - just log and return
+    if (res.headersSent) {
+      logger.error(`[${requestId}] Error occurred after headers sent:`, error);
+      return;
+    }
 
     // Return OpenAI-format error
     const openaiError = translateAnthropicErrorToOpenAI(
